@@ -1,0 +1,20 @@
+{
+  "name": "precompact-router",
+  "version": "v0.1.0",
+  "slug": "precompact-router",
+  "class": "substrate",
+  "description": "Holographic fleet-level PreCompact router. One entry in settings.json dispatches to the correct agent's hook via a distributed fungal registry. Each body gets its own precompact-router.py + agent-registry.json; the same script at every level reads its local registry and routes to sub-routers or leaf hooks. Fleet router only knows about top-level bodies; each body's router knows its own children.",
+  "files": [
+    "precompact-router.py",
+    "precompact-router.sh",
+    "agent-register.py"
+  ],
+  "install_targets": {
+    "fleet": "<fleet-root>/runtime/",
+    "body": "<body>/runtime/"
+  },
+  "post_install_fleet": "Wire settings.json: hooks.PreCompact -> bash '<fleet>/runtime/precompact-router.sh'",
+  "post_install_body": "Creates <body>/runtime/agent-registry.json and precompact-router.sh for sub-routing",
+  "created_at": "2026-06-25T00:00:00Z",
+  "notes": "Fungal distribution pattern: routing intelligence lives at every level, not concentrated at the head."
+}
