@@ -40,6 +40,58 @@ def log(log_path, msg):
     except Exception:
         pass
 
+
+# ── OS / shell detection layer ────────────────────────────────────────────────
+# On Windows there can be MULTIPLE bash environments with INCOMPATIBLE drive mounts:
+#   - Git Bash / MSYS2  → mounts drives at /c/   (this is what Claude Code uses)
+#   - WSL2 bash         → mounts drives at /mnt/c/
+# A bare `bash` on PATH frequently resolves to WSL, which then cannot resolve the
+# /c/... or C:/... paths our hooks use, and every hook silently no-ops. We must
+# therefore find and invoke the SAME (MSYS) bash that the harness uses.
+#
+# Override with env HEARTH_BASH=/path/to/bash.exe if detection is ever wrong.
+
+def find_bash() -> str:
+    override = os.environ.get("HEARTH_BASH")
+    if override and Path(override).exists():
+        return override
+
+    if os.name != "nt":
+        return "bash"  # POSIX: bare bash is correct
+
+    # Windows: prefer Git Bash (MSYS). Check common install locations.
+    candidates = [
+        r"C:\Program Files\Git\bin\bash.exe",
+        r"C:\Program Files\Git\usr\bin\bash.exe",
+        r"C:\Program Files (x86)\Git\bin\bash.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Programs\Git\bin\bash.exe"),
+    ]
+    for c in candidates:
+        if c and Path(c).exists():
+            return c
+
+    # Derive from `git` on PATH: <git>/cmd/git.exe → <git>/bin/bash.exe
+    try:
+        import shutil
+        git = shutil.which("git")
+        if git:
+            root = Path(git).parent.parent  # .../Git
+            for sub in ("bin/bash.exe", "usr/bin/bash.exe"):
+                cand = root / sub
+                if cand.exists():
+                    return str(cand)
+    except Exception:
+        pass
+
+    return "bash"  # last resort (may be WSL — logged by caller)
+
+
+def to_msys(p: str) -> str:
+    """Windows path (C:/foo or C:\\foo) → MSYS form (/c/foo) that Git Bash resolves."""
+    if not p or len(p) < 2 or p[1] != ":":
+        return p
+    return f"/{p[0].lower()}{p[2:].replace(chr(92), '/')}"
+
 def main():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--registry-dir", default=None)
@@ -102,14 +154,47 @@ def main():
         log(log_path, f"no match in {len(agents)} agents for transcript={transcript_path!r}")
         sys.exit(0)
 
+    def resolve(p):
+        """Resolve a path that may be relative (to registry_dir) or absolute.
+        Returns forward-slash path so bash can accept it on Windows."""
+        if not p:
+            return ""
+        pp = Path(p)
+        if pp.is_absolute():
+            return str(pp).replace("\\", "/")
+        return str((registry_dir / pp).resolve()).replace("\\", "/")
+
     slug = matched.get("slug", "?")
-    sub_router = matched.get("sub_router", "")
-    hook = matched.get("hook", "")
-    agent_root = matched.get("agent_root", "")
+    sub_router = resolve(matched.get("sub_router", ""))
+    hook = resolve(matched.get("hook", ""))
+    agent_root = resolve(matched.get("agent_root", ""))
 
     env = os.environ.copy()
     if agent_root:
-        env["AGENT_ROOT"] = agent_root
+        # bash hook needs MSYS form; python sub-routers ignore this env var entirely.
+        env["AGENT_ROOT"] = to_msys(agent_root)
+
+    bash_exe = find_bash()
+
+    def dispatch_sh(path: str, label: str) -> "subprocess.CompletedProcess[bytes]":
+        """Dispatch a .sh target. Sub-routers are pure-Python (companion .py) so we
+        skip bash entirely. Leaf hooks need the CORRECT (MSYS/Git) bash — see find_bash()
+        — invoked with cwd+relative-name so the script path needs no drive translation."""
+        p = Path(path)
+        if p.suffix == ".sh":
+            companion = p.with_suffix(".py")
+            if companion.is_file():
+                sub_dir = str(companion.parent).replace("\\", "/")
+                log(log_path, f"   ({label}: calling companion .py directly)")
+                return subprocess.run(
+                    [sys.executable, str(companion), "--registry-dir", sub_dir],
+                    input=raw, env=env,
+                )
+            log(log_path, f"   ({label}: bash={bash_exe!r} cwd+name)")
+            return subprocess.run(
+                [bash_exe, p.name], input=raw, env=env, cwd=str(p.parent)
+            )
+        return subprocess.run([bash_exe, path], input=raw, env=env)
 
     # Branch: delegate to sub-router
     if sub_router:
@@ -117,7 +202,7 @@ def main():
             log(log_path, f"WARN: {slug} sub_router missing at {sub_router!r}, soft-exit")
             sys.exit(0)
         log(log_path, f"-> sub-router: {slug} (pattern={matched['owner_pattern']!r})")
-        result = subprocess.run(["bash", sub_router], input=raw, env=env)
+        result = dispatch_sh(sub_router, "sub-router")
         log(log_path, f"   sub-router exit={result.returncode}")
         sys.exit(result.returncode)
 
@@ -127,7 +212,7 @@ def main():
             log(log_path, f"WARN: {slug} hook missing at {hook!r}, soft-exit")
             sys.exit(0)
         log(log_path, f"-> hook: {slug} (pattern={matched['owner_pattern']!r})")
-        result = subprocess.run(["bash", hook], input=raw, env=env)
+        result = dispatch_sh(hook, "hook")
         log(log_path, f"   hook exit={result.returncode}")
         sys.exit(result.returncode)
 
