@@ -1,0 +1,6 @@
+# Shell scripts and Python must stay LF — CRLF breaks bash (and our hooks)
+# on the MSYS/Git-Bash path the harness uses.
+*.sh   text eol=lf
+*.py   text eol=lf
+*.json text eol=lf
+*.md   text eol=lf
